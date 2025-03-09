@@ -3,7 +3,7 @@
 ;; Copyright (C) 2020 Markus Läll
 ;;
 ;; URL: https://github.com/eyeinsky/org-anki
-;; Version: 3.1.3
+;; Version: 3.3.2
 ;; Author: Markus Läll <markus.l2ll@gmail.com>
 ;; Keywords: outlines, flashcards, memory
 ;; Package-Requires: ((emacs "27.1") (request "0.3.2") (dash "2.17") (promise "1.1"))
@@ -72,7 +72,9 @@ property"
     ("Basic (optional reversed card)" "Front" "Back")
     ("NameDescr" "Name" "Descr")
     ("Cloze" "Text" "Extra"))
-  "Default fields for note types."
+  "Default fields for note types.
+
+Each one is a list, the first item is the model name and the rest are field names."
   :type '(repeat (list (repeat string)))
   :group 'org-anki)
 
@@ -92,9 +94,20 @@ property"
   :type '(string)
   :group 'org-anki)
 
+(defcustom org-anki-api-key nil
+  "API key to authenticate to AnkiConnect.
+See https://foosoft.net/projects/anki-connect/#authentication for more."
+  :type '(string)
+  :group 'org-anki)
+
 (defcustom org-anki-inherit-tags t
   "Inherit tags, set to nil to turn off."
   :type 'boolean
+  :group 'org-anki)
+
+(defcustom org-anki-ignored-tags nil
+  "Tags that are always ignored when syncing to Anki."
+  :type '(repeat string)
   :group 'org-anki)
 
 (defcustom org-anki-skip-function nil
@@ -139,7 +152,10 @@ customizable by the org-anki-ankiconnnect-listen-address variable.
 
 BODY is the alist json payload, CALLBACK the function to call
 with result."
-  (let ((json (json-encode `(("version" . 6) ,@body))))
+  (let ((json (json-encode
+               `(("version" . 6)
+                 ,@(if org-anki-api-key `(("key" . ,org-anki-api-key)))
+                 ,@body))))
     (request
       org-anki-ankiconnnect-listen-address
       :type "GET"
@@ -363,17 +379,17 @@ be removed from the Anki app, return actions that do that."
 (defun org-anki--report-error (format &rest args)
   "FORMAT the ERROR and prefix it with `org-anki error'."
   (let ((fmt (concat "org-anki error: " format)))
-    (apply 'message (cons fmt args))))
+    (apply #'message fmt args)))
 
 (defun org-anki--report (format_ &rest args)
   "FORMAT_ the ARGS and prefix it with `org-anki'."
   (let* ((fmt (concat "org-anki: " format_)))
-    (message fmt args)))
+    (apply #'message fmt args)))
 
 (defun org-anki--debug (format_ &rest args)
   "FORMAT_ the ARGS and prefix it with `org-anki'."
   (let* ((fmt (concat "org-anki debug: " format_)))
-    (message fmt args)))
+    (apply #'message fmt args)))
 
 (defun org-anki--no-action () (org-anki--report "No action taken."))
 
@@ -399,14 +415,19 @@ be removed from the Anki app, return actions that do that."
     (if (stringp file-global) file-global org-anki-default-match)))
 
 (defun org-anki--get-tags ()
-  (delete-dups
-   (split-string
-    (let ((global-tags (org-anki--get-global-prop org-anki-prop-global-tags)))
-      (concat
-       (if org-anki-inherit-tags
-           (substring-no-properties (or (org-entry-get nil "ALLTAGS") ""))
-         (org-entry-get nil "TAGS"))
-       global-tags)) ":" t)))
+  ;; :: IO [Tag]
+  "Get list of tags for org entry at point; filter out ignored tags."
+  (cl-delete-if
+   (lambda (tag) (member tag org-anki-ignored-tags))
+   (delete-dups
+    (split-string
+     (let ((global-tags (org-anki--get-global-prop org-anki-prop-global-tags)))
+       (concat
+        (if org-anki-inherit-tags
+            (substring-no-properties (or (org-entry-get nil "ALLTAGS") ""))
+          (org-entry-get nil "TAGS"))
+        global-tags))
+     ":" t))))
 
 ;;; Cloze
 
@@ -602,7 +623,16 @@ be removed from the Anki app, return actions that do that."
 
 (defun org-anki--get-model-fields (model)
   ;; :: String -> [FieldName]
-  (cdr (assoc model org-anki-model-fields)))
+  (let ((fields (cdr (assoc model org-anki-model-fields))))
+    (unless fields
+      (error "No fields for '%s', please customize `org-anki-model-fields'."
+             model))
+    fields))
+
+(defun org-anki--note-complete (note)
+  ;; :: Note -> Bool
+  "Test if all fields of a NOTE have values (i.e, are not nil)"
+  (equal nil (rassq "" (org-anki--note-fields note))))
 
 ;; Public API
 
@@ -630,18 +660,35 @@ be removed from the Anki app, return actions that do that."
   (interactive)
   (with-current-buffer (or buffer (buffer-name))
     (org-anki--sync-notes
-     (org-map-entries 'org-anki--note-at-point (org-anki--get-match) nil org-anki-skip-function))))
+     (-filter
+      'org-anki--note-complete
+      (org-map-entries
+       'org-anki--note-at-point (org-anki--get-match) nil org-anki-skip-function)))))
 
 ;;;###autoload
 (defun org-anki-update-all (&optional buffer)
   ;; :: Maybe Buffer -> IO ()
-  "Updates all entries in optional BUFFER.
-
-Updates all entries that have ANKI_NOTE_ID property set."
+  "Updates all entries having ANKI_NOTE_ID property in BUFFER."
   (interactive)
   (with-current-buffer (or buffer (buffer-name))
     (org-anki--sync-notes
      (org-map-entries 'org-anki--note-at-point "ANKI_NOTE_ID<>\"\""))))
+
+;;;###autoload
+(defun org-anki-update-dir (&optional prefix dir)
+  ;; :: Maybe Buffer -> IO ()
+  "Updates all entries having ANKI_NOTE_ID property in every .org file in DIR.
+
+If you also want to include its sub-directories, prefix the
+command by hitting `C-u' first."
+  (interactive "P\nDChoose a directory: ")
+  (let* ((org-regex "\\.org\\'")
+         (files (if prefix (directory-files-recursively dir org-regex)
+                  (directory-files dir 'full org-regex))))
+    (dolist (file files)
+      (org-anki--report "updating file %s" file)
+      (with-current-buffer (find-file-noselect file)
+        (org-anki-update-all)))))
 
 ;;;###autoload
 (defun org-anki-delete-entry ()
